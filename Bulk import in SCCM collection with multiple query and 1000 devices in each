@@ -5,6 +5,9 @@ $SCCMServer = "YourSCCMServer"
 # Define the device collection name
 $CollectionName = "YourDeviceCollectionName"
 
+# Define the query name prefix
+$QueryNamePrefix = "YourQueryNamePrefix"
+
 # Path to the file containing the list of device names or IDs
 $DeviceListPath = "C:\Path\To\Your\DeviceList.txt"
 
@@ -26,7 +29,7 @@ for ($i = 0; $i -lt $DeviceList.Count; $i += 1000) {
 
 # Loop through each chunk and add a query rule to the collection
 for ($j = 0; $j -lt $DeviceChunks.Count; $j++) {
-    $QueryName = "$CollectionName-Query-$($j + 1)"
+    $QueryName = "$QueryNamePrefix-Query-$($j + 1)"
     $QueryExpression = "SELECT * FROM SMS_R_System WHERE ResourceID IN (" + ($DeviceChunks[$j] -join ",") + ")"
     
     # Add the query rule to the collection
@@ -34,4 +37,3 @@ for ($j = 0; $j -lt $DeviceChunks.Count; $j++) {
 }
 
 Write-Output "Queries have been added to the collection."
-
