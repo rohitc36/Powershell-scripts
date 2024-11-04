@@ -3,20 +3,21 @@ $SiteCode = "YourSiteCode"
 $SCCMServer = "YourSCCMServer"
 
 # Define the device collection name
-$CollectionName = "YourDeviceCollectionName"
+$CollectionName = "Your Collection name"
 
 # Define the query name prefix
-$QueryNamePrefix = "YourQueryNamePrefix"
+$QueryNamePrefix = "Phase-1"
 
 # Path to the file containing the list of device names or IDs
-$DeviceListPath = "C:\Path\To\Your\DeviceList.txt"
+$DeviceListPath = "C:\Users\rchaudh1\Desktop\text.txt"
 
 # Read the device list from the file
 $DeviceList = Get-Content -Path $DeviceListPath
 
+
 # Connect to the SCCM site
-Import-Module "$($Env:SMS_ADMIN_UI_PATH)\..\ConfigurationManager.psd1"
-cd "$SiteCode`:$"
+#Import-Module "$($Env:SMS_ADMIN_UI_PATH)\..\ConfigurationManager.psd1"
+#cd "$SiteCode`:$"
 
 # Get the device collection
 $Collection = Get-CMDeviceCollection -Name $CollectionName
@@ -29,11 +30,12 @@ for ($i = 0; $i -lt $DeviceList.Count; $i += 1000) {
 
 # Loop through each chunk and add a query rule to the collection
 for ($j = 0; $j -lt $DeviceChunks.Count; $j++) {
-    $QueryName = "$QueryNamePrefix-Query-$($j + 1)"
-    $QueryExpression = "SELECT * FROM SMS_R_System WHERE ResourceID IN (" + ($DeviceChunks[$j] -join ",") + ")"
+    $QueryName = "$QueryNamePrefix-Part-$($j + 1)"
+    $QueryExpression = "select * from SMS_R_System where SMS_R_System.Name in ('" + ($DeviceChunks[$j] -join "','") + "')"
+
     
     # Add the query rule to the collection
-    Add-CMDeviceCollectionQueryMembershipRule -CollectionId $Collection.CollectionID -QueryName $QueryName -QueryExpression $QueryExpression
+    Add-CMDeviceCollectionQueryMembershipRule -CollectionId $Collection.CollectionID -RuleName $QueryName -QueryExpression $QueryExpression
 }
 
 Write-Output "Queries have been added to the collection."
