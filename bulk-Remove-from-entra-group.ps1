@@ -1,6 +1,6 @@
-﻿# Input Variables
+# Input Variables
 $csvPath = "C:\Path\Devices.csv" # Replace with the path to your CSV file
-$groupId = "b3c2ab14-XXXX-4d4e-a9ee-XXXXXXXXXXXX" # Replace with your group ID
+$groupName = "Intune win.testGroup_Script verification" # Replace with your group name
 
 # Install the AzureAD module if not already installed
 if (-not (Get-Module -ListAvailable -Name AzureAD)) {
@@ -9,6 +9,10 @@ if (-not (Get-Module -ListAvailable -Name AzureAD)) {
 
 # Connect to Azure AD
 Connect-AzureAD
+
+# Retrieve the group ID from the group name
+Write-Host "Retrieving group ID for group name: $groupName"
+$groupId = (Get-AzureADGroup -Filter "DisplayName eq '$groupName'").ObjectId
 
 # Import device names from the CSV file
 Write-Host "Importing device names from CSV file: $csvPath"
@@ -23,15 +27,15 @@ $deviceIds = foreach ($deviceName in $deviceNames) {
     Get-AzureADDevice -SearchString $deviceName | Select-Object -ExpandProperty ObjectId
 }
 
-# Using the specified group ID
+# Using the retrieved group ID
 Write-Host "Using group ID: $groupId"
 
 # Remove each device from the specified group with progress count
 $currentDevice = 0
 foreach ($deviceId in $deviceIds) {
     $currentDevice++
-    Write-Host "Removing device ID $deviceId from group $groupId ($currentDevice of $totalDevices)"
+    Write-Host "Removing device ID $deviceId from group $groupName ($currentDevice of $totalDevices)"
     Remove-AzureADGroupMember -ObjectId $groupId -MemberId $deviceId
 }
 
-Write-Host "Script execution completed. Total devices processed: $totalDevices"
+Write-Host "Script execution completed. Total devices processed: $currentDevice/$totalDevices"
