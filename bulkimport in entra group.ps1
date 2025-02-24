@@ -1,6 +1,6 @@
 ﻿# Input Variables
 $csvPath = "C:\Path\Devices.csv" # Replace with the path to your CSV file
-$groupId = "b3c2ab14-4b5b-4d4e-a9ee-a58898f055e5" # Replace with your group ID
+$groupId = "b3c2ab14-XXXX-4d4e-a9ee-XXXXXXXXXXXX" # Replace with your group ID
 
 # Install the AzureAD module if not already installed
 if (-not (Get-Module -ListAvailable -Name AzureAD)) {
