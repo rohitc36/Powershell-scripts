@@ -1,5 +1,9 @@
 # Input Variables
-$targetGroupName = "Intune.Win.WKS.APPS.Nexaweb.Launcher.en-US.1.4.2.0008.Required"
+
+# Target Entra group needs to change the Ebtra group Name below
+$targetGroupName = "Intune.Win.WKS.APPS.Nexaweb.Launcher.en-US.1.4.2.0008.Required"  
+
+# List of source AD groups you can add one to multiple. 
 $sourceGroupNames = @(
     "Nexaweb_Launcher_en-US_1.4.2.0008.Required.CETS",
     "Another_Source_Group_1",
