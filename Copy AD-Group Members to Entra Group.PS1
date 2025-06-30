@@ -1,10 +1,18 @@
 # Input Variables
-$targetGroupName = "Intune.Win.WKS.APPS.Nexaweb.Launcher.en-US.1.4.2.0008.Required" # Target Azure AD group
+$targetGroupName = "Intune.Win.WKS.APPS.Nexaweb.Launcher.en-US.1.4.2.0008.Required"
 $sourceGroupNames = @(
     "Nexaweb_Launcher_en-US_1.4.2.0008.Required.CETS",
     "Another_Source_Group_1",
     "Another_Source_Group_2"
-) # List of source AD groups
+)
+
+# Define log file path in the same directory as the script
+$scriptPath = $MyInvocation.MyCommand.Path
+$scriptDir = Split-Path $scriptPath
+$logFile = Join-Path $scriptDir "Device_Addition_Log.log"
+
+# Initialize log file
+"[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Starting device addition process..." | Out-File -FilePath $logFile -Encoding UTF8
 
 # Install the AzureAD module if not already installed
 if (-not (Get-Module -ListAvailable -Name AzureAD)) {
@@ -39,17 +47,22 @@ foreach ($sourceGroupName in $sourceGroupNames) {
 
         if ($devices) {
             foreach ($device in $devices) {
-                Write-Host "Adding device ID $($device.ObjectId) to group $targetGroupName"
                 try {
                     Add-AzureADGroupMember -ObjectId $targetGroupId -RefObjectId $device.ObjectId
+                    $status = "Success"
                 } catch {
+                    $status = "Failed: $($_.Exception.Message)"
                     Write-Warning "Failed to add device $deviceName with ID $($device.ObjectId): $_"
                 }
+                "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Group: $sourceGroupName | Device: $deviceName | Status: $status" | Out-File -FilePath $logFile -Append -Encoding UTF8
             }
         } else {
+            $status = "Failed: Device not found in Azure AD"
             Write-Warning "Device $deviceName not found in Azure AD."
+            "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Group: $sourceGroupName | Device: $deviceName | Status: $status" | Out-File -FilePath $logFile -Append -Encoding UTF8
         }
     }
 }
 
 Write-Host "`nScript execution completed. Total devices processed: $currentDevice"
+Write-Host "Log file saved to: $logFile"
