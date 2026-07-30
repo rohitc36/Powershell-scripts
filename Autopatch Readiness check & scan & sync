@@ -1,0 +1,739 @@
+<#
+.SYNOPSIS
+    Windows Autopatch Service Desk Remediation and Reporting Script
+
+.VERSION
+    5.0 Production
+
+.PURPOSE
+    Designed for Service Desk engineers to troubleshoot and remediate Windows Autopatch
+    reporting states such as Client State = Unknown and Client Substate = Unknown.
+
+.WHAT THIS SCRIPT DOES
+    1. Creates a detailed transcript log
+    2. Performs key Autopatch health checks
+    3. Triggers Intune sync and waits for discovered sync tasks to complete
+    4. Performs a synchronous Windows Update scan using Windows Update Agent COM object
+    5. Falls back to UsoClient StartScan if COM scan is unavailable
+    6. Discovers and runs telemetry/reporting scheduled tasks where available
+    7. Validates telemetry and Windows Update events
+    8. Produces a CSV summary report
+    9. Provides Autopatch Readiness as PASS, WARN, or FAIL
+
+.RUN REQUIREMENTS
+    Run PowerShell as Administrator.
+
+.NOTES
+    This script does not use UsoClient StartInteractiveScan because that command opens the
+    Windows Update UI and is not ideal for Service Desk automation or remote execution.
+#>
+
+# =====================================================================
+# Initialisation
+# =====================================================================
+
+$ErrorActionPreference = "Continue"
+$ScriptVersion = "5.0 Production"
+$RunStartTime = Get-Date
+$ComputerName = $env:COMPUTERNAME
+
+if (!(Test-Path "C:\Temp")) {
+    New-Item -Path "C:\Temp" -ItemType Directory -Force | Out-Null
+}
+
+$TimeStamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$TranscriptPath = "C:\Temp\Autopatch_ServiceDesk_$($ComputerName)_$TimeStamp.log"
+$CsvReportPath = "C:\Temp\Autopatch_ServiceDesk_$($ComputerName)_$TimeStamp.csv"
+
+try {
+    Start-Transcript -Path $TranscriptPath -Force | Out-Null
+}
+catch {
+    Write-Host "[WARN ] Unable to start transcript: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+
+$script:Results = @()
+$script:ReadinessReasons = @()
+
+# =====================================================================
+# Logging helpers
+# =====================================================================
+
+function Write-Section {
+    param([string]$Title)
+
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor DarkCyan
+    Write-Host $Title -ForegroundColor Cyan
+    Write-Host "============================================================" -ForegroundColor DarkCyan
+}
+
+function Write-Info {
+    param([string]$Message)
+    Write-Host "[INFO ] $Message" -ForegroundColor Cyan
+}
+
+function Write-Pass {
+    param([string]$Message)
+    Write-Host "[PASS ] $Message" -ForegroundColor Green
+}
+
+function Write-WarnLog {
+    param([string]$Message)
+    Write-Host "[WARN ] $Message" -ForegroundColor Yellow
+}
+
+function Write-Fail {
+    param([string]$Message)
+    Write-Host "[FAIL ] $Message" -ForegroundColor Red
+}
+
+function Add-Result {
+    param(
+        [string]$Check,
+        [ValidateSet("PASS","WARN","FAIL","INFO")]
+        [string]$Status,
+        [string]$Details
+    )
+
+    $script:Results += [PSCustomObject]@{
+        Time    = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+        Check   = $Check
+        Status  = $Status
+        Details = $Details
+    }
+
+    switch ($Status) {
+        "PASS" { Write-Pass "$Check - $Details" }
+        "WARN" { Write-WarnLog "$Check - $Details" }
+        "FAIL" { Write-Fail "$Check - $Details" }
+        "INFO" { Write-Info "$Check - $Details" }
+    }
+}
+
+function Add-ReadinessReason {
+    param([string]$Reason)
+    $script:ReadinessReasons += $Reason
+}
+
+function Get-DsregValue {
+    param(
+        [string[]]$DsregOutput,
+        [string]$Name
+    )
+
+    $Line = $DsregOutput | Select-String -Pattern "^\s*$Name\s*:" | Select-Object -First 1
+
+    if ($Line) {
+        return ($Line.ToString().Split(":", 2)[1]).Trim()
+    }
+
+    return $null
+}
+
+function Wait-ScheduledTaskCompletion {
+    param(
+        [string]$TaskName,
+        [string]$TaskPath,
+        [int]$TimeoutSeconds = 300
+    )
+
+    $Elapsed = 0
+    $Interval = 5
+
+    while ($Elapsed -lt $TimeoutSeconds) {
+        try {
+            $CurrentTask = Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction Stop
+
+            if ($CurrentTask.State -ne "Running") {
+                return "Completed"
+            }
+
+            Write-Info "Task still running: $TaskPath$TaskName. Elapsed seconds: $Elapsed"
+        }
+        catch {
+            return "Unable to verify task state: $($_.Exception.Message)"
+        }
+
+        Start-Sleep -Seconds $Interval
+        $Elapsed += $Interval
+    }
+
+    return "Timeout waiting for task completion after $TimeoutSeconds seconds"
+}
+
+function Start-AndWaitScheduledTask {
+    param(
+        [string]$TaskName,
+        [string]$TaskPath,
+        [string]$ResultName,
+        [int]$TimeoutSeconds = 300
+    )
+
+    try {
+        Write-Info "Starting scheduled task: $TaskPath$TaskName"
+        Start-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction Stop
+
+        Start-Sleep -Seconds 5
+
+        $WaitResult = Wait-ScheduledTaskCompletion -TaskName $TaskName -TaskPath $TaskPath -TimeoutSeconds $TimeoutSeconds
+
+        if ($WaitResult -eq "Completed") {
+            Add-Result $ResultName "PASS" "Task started and completed"
+        }
+        else {
+            Add-Result $ResultName "WARN" $WaitResult
+        }
+    }
+    catch {
+        Add-Result $ResultName "WARN" $_.Exception.Message
+    }
+}
+
+# =====================================================================
+# Header
+# =====================================================================
+
+Write-Section "WINDOWS AUTOPATCH SERVICE DESK REMEDIATION SCRIPT - VERSION $ScriptVersion"
+Write-Info "Run started at: $RunStartTime"
+Write-Info "Computer name: $ComputerName"
+Write-Info "Transcript log: $TranscriptPath"
+Write-Info "CSV report path: $CsvReportPath"
+Write-Info "Run PowerShell as Administrator for best results."
+
+# =====================================================================
+# 1. Device information
+# =====================================================================
+
+Write-Section "STEP 1 - DEVICE INFORMATION"
+
+try {
+    $OS = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+    $BIOS = Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue
+    $ComputerSystem = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+
+    Add-Result "Computer Name" "INFO" $ComputerName
+    Add-Result "Logged-on User" "INFO" $env:USERNAME
+    Add-Result "OS Caption" "INFO" $OS.Caption
+    Add-Result "OS Version" "INFO" $OS.Version
+    Add-Result "OS Build" "INFO" $OS.BuildNumber
+
+    if ($ComputerSystem) {
+        Add-Result "Device Manufacturer" "INFO" $ComputerSystem.Manufacturer
+        Add-Result "Device Model" "INFO" $ComputerSystem.Model
+    }
+
+    if ($BIOS) {
+        Add-Result "Serial Number" "INFO" $BIOS.SerialNumber
+    }
+}
+catch {
+    Add-Result "Device Information" "WARN" $_.Exception.Message
+}
+
+# =====================================================================
+# 2. Entra ID and MDM registration
+# =====================================================================
+
+Write-Section "STEP 2 - ENTRA ID REGISTRATION AND INTUNE ENROLMENT"
+
+try {
+    Write-Info "Running dsregcmd /status"
+    $dsreg = dsregcmd /status
+
+    $AzureADJoined    = Get-DsregValue -DsregOutput $dsreg -Name "AzureAdJoined"
+    $DomainJoined     = Get-DsregValue -DsregOutput $dsreg -Name "DomainJoined"
+    $DeviceAuthStatus = Get-DsregValue -DsregOutput $dsreg -Name "DeviceAuthStatus"
+    $TenantName       = Get-DsregValue -DsregOutput $dsreg -Name "TenantName"
+    $MdmUrl           = Get-DsregValue -DsregOutput $dsreg -Name "MdmUrl"
+
+    Write-Info "AzureAdJoined: $AzureADJoined"
+    Write-Info "DomainJoined: $DomainJoined"
+    Write-Info "DeviceAuthStatus: $DeviceAuthStatus"
+    Write-Info "TenantName: $TenantName"
+    Write-Info "MdmUrl present: $([bool]$MdmUrl)"
+
+    if ($AzureADJoined -eq "YES") {
+        Add-Result "Azure AD Joined" "PASS" "AzureAdJoined = YES"
+    }
+    else {
+        Add-Result "Azure AD Joined" "FAIL" "AzureAdJoined = $AzureADJoined"
+        Add-ReadinessReason "Azure AD Joined is not YES."
+    }
+
+    if ($DeviceAuthStatus -eq "SUCCESS") {
+        Add-Result "Device Authentication" "PASS" "DeviceAuthStatus = SUCCESS"
+    }
+    else {
+        Add-Result "Device Authentication" "FAIL" "DeviceAuthStatus = $DeviceAuthStatus"
+        Add-ReadinessReason "Device authentication is not SUCCESS."
+    }
+
+    if ($DomainJoined) {
+        Add-Result "Domain Joined" "INFO" "DomainJoined = $DomainJoined"
+    }
+
+    if ($TenantName) {
+        Add-Result "Tenant Name" "INFO" $TenantName
+    }
+
+    if ($MdmUrl) {
+        Add-Result "MDM Enrollment" "PASS" "MDM URL is present"
+    }
+    else {
+        Add-Result "MDM Enrollment" "FAIL" "MDM URL is missing"
+        Add-ReadinessReason "MDM URL is missing from dsregcmd output."
+    }
+}
+catch {
+    Add-Result "Entra ID and MDM Check" "FAIL" $_.Exception.Message
+    Add-ReadinessReason "Unable to complete dsregcmd validation."
+}
+
+# =====================================================================
+# 3. Diagnostic Data service
+# =====================================================================
+
+Write-Section "STEP 3 - DIAGNOSTIC DATA SERVICE"
+
+try {
+    $DiagTrack = Get-Service DiagTrack -ErrorAction Stop
+    Write-Info "DiagTrack Status: $($DiagTrack.Status)"
+    Write-Info "DiagTrack StartType: $($DiagTrack.StartType)"
+
+    if ($DiagTrack.Status -eq "Running") {
+        Add-Result "DiagTrack Service" "PASS" "Status = Running, StartType = $($DiagTrack.StartType)"
+    }
+    else {
+        Add-Result "DiagTrack Service" "FAIL" "Status = $($DiagTrack.Status), StartType = $($DiagTrack.StartType)"
+        Add-ReadinessReason "DiagTrack service is not running."
+    }
+}
+catch {
+    Add-Result "DiagTrack Service" "FAIL" $_.Exception.Message
+    Add-ReadinessReason "DiagTrack service could not be queried."
+}
+
+# =====================================================================
+# 4. Windows Update for Business policy state
+# =====================================================================
+
+Write-Section "STEP 4 - WINDOWS UPDATE FOR BUSINESS POLICY STATE"
+
+try {
+    $PolicyPath = "HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UpdatePolicy\PolicyState"
+    Write-Info "Reading registry path: $PolicyPath"
+
+    $WUFB = Get-ItemProperty $PolicyPath -ErrorAction Stop
+
+    $IsWUfBConfigured = $WUFB.IsWUfBConfigured
+    $IsWUfBDualScanActive = $WUFB.IsWUfBDualScanActive
+    $IsDeferralActive = $WUFB.IsDeferralActive
+    $BranchReadinessLevel = $WUFB.BranchReadinessLevel
+
+    Write-Info "IsWUfBConfigured: $IsWUfBConfigured"
+    Write-Info "IsWUfBDualScanActive: $IsWUfBDualScanActive"
+    Write-Info "IsDeferralActive: $IsDeferralActive"
+    Write-Info "BranchReadinessLevel: $BranchReadinessLevel"
+
+    if ($IsWUfBConfigured -eq 1) {
+        Add-Result "Windows Update for Business" "PASS" "IsWUfBConfigured = 1"
+    }
+    else {
+        Add-Result "Windows Update for Business" "FAIL" "IsWUfBConfigured = $IsWUfBConfigured"
+        Add-ReadinessReason "Windows Update for Business is not configured."
+    }
+
+    Add-Result "WUfB Dual Scan" "INFO" "IsWUfBDualScanActive = $IsWUfBDualScanActive"
+    Add-Result "WUfB Deferral" "INFO" "IsDeferralActive = $IsDeferralActive"
+    Add-Result "Branch Readiness Level" "INFO" "BranchReadinessLevel = $BranchReadinessLevel"
+}
+catch {
+    Add-Result "Windows Update for Business" "FAIL" "PolicyState registry path not found or inaccessible: $($_.Exception.Message)"
+    Add-ReadinessReason "Windows Update for Business policy state could not be validated."
+}
+
+# =====================================================================
+# 5. WSUS conflict detection
+# =====================================================================
+
+Write-Section "STEP 5 - WSUS CONFLICT DETECTION"
+
+try {
+    $WURegPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
+    Write-Info "Checking registry path: $WURegPath"
+
+    if (Test-Path $WURegPath) {
+        $WUReg = Get-ItemProperty $WURegPath -ErrorAction SilentlyContinue
+
+        if ($WUReg.WUServer) {
+            Add-Result "WSUS Configuration" "WARN" "WUServer found: $($WUReg.WUServer)"
+            Add-ReadinessReason "WSUS configuration detected. Validate whether this is expected for the co-management workload."
+        }
+        else {
+            Add-Result "WSUS Configuration" "PASS" "No WUServer value found"
+        }
+    }
+    else {
+        Add-Result "WSUS Configuration" "PASS" "WindowsUpdate policy path not present"
+    }
+}
+catch {
+    Add-Result "WSUS Configuration" "WARN" $_.Exception.Message
+}
+
+# =====================================================================
+# 6. Latest installed update
+# =====================================================================
+
+Write-Section "STEP 6 - LATEST INSTALLED UPDATE"
+
+try {
+    Write-Info "Querying latest installed hotfix"
+
+    $LatestUpdate = Get-HotFix |
+        Sort-Object InstalledOn -Descending |
+        Select-Object -First 1
+
+    if ($LatestUpdate) {
+        Add-Result "Latest Installed Update" "PASS" "$($LatestUpdate.HotFixID) installed on $($LatestUpdate.InstalledOn)"
+    }
+    else {
+        Add-Result "Latest Installed Update" "WARN" "No hotfix data returned"
+        Add-ReadinessReason "Latest installed update could not be determined."
+    }
+}
+catch {
+    Add-Result "Latest Installed Update" "WARN" $_.Exception.Message
+    Add-ReadinessReason "Latest installed update check returned a warning."
+}
+
+# =====================================================================
+# 7. Trigger Intune sync and wait
+# =====================================================================
+
+Write-Section "STEP 7 - INTUNE SYNC"
+
+try {
+    Write-Info "Discovering Intune Management Extension PushLaunch scheduled tasks"
+
+    $PushLaunchTasks = Get-ScheduledTask -ErrorAction SilentlyContinue |
+        Where-Object { $_.TaskName -like "*PushLaunch*" }
+
+    if ($PushLaunchTasks) {
+        foreach ($Task in $PushLaunchTasks) {
+            Write-Info "Discovered Intune sync task: $($Task.TaskPath)$($Task.TaskName)"
+            Start-AndWaitScheduledTask `
+                -TaskName $Task.TaskName `
+                -TaskPath $Task.TaskPath `
+                -ResultName "Intune Sync Task: $($Task.TaskName)" `
+                -TimeoutSeconds 300
+        }
+
+        Add-Result "Intune Sync Stage" "PASS" "All discovered PushLaunch tasks processed"
+    }
+    else {
+        Add-Result "Intune Sync Stage" "WARN" "No PushLaunch scheduled task found"
+        Add-ReadinessReason "No PushLaunch task found. Device may still be enrolled, but sync task could not be triggered by this script."
+    }
+}
+catch {
+    Add-Result "Intune Sync Stage" "WARN" $_.Exception.Message
+    Add-ReadinessReason "Intune sync stage returned a warning."
+}
+
+# =====================================================================
+# 8. Windows Update scan
+# =====================================================================
+
+Write-Section "STEP 8 - WINDOWS UPDATE SCAN"
+
+try {
+    Write-Info "Attempting synchronous scan using Windows Update Agent COM object"
+    Write-Info "This method waits for the scan operation to return a result"
+
+    $LastWUEventBeforeScan = Get-WinEvent `
+        -LogName "Microsoft-Windows-WindowsUpdateClient/Operational" `
+        -MaxEvents 1 `
+        -ErrorAction SilentlyContinue
+
+    $WUEventBeforeTime = $null
+    if ($LastWUEventBeforeScan) {
+        $WUEventBeforeTime = $LastWUEventBeforeScan.TimeCreated
+        Write-Info "Latest Windows Update event before scan: ID $($LastWUEventBeforeScan.Id) at $WUEventBeforeTime"
+    }
+
+    $UpdateSession = New-Object -ComObject Microsoft.Update.Session
+    $UpdateSearcher = $UpdateSession.CreateUpdateSearcher()
+    $SearchResult = $UpdateSearcher.Search("IsInstalled=0 and Type='Software'")
+
+    Add-Result "Windows Update Scan" "PASS" "COM scan completed. Available software updates detected: $($SearchResult.Updates.Count)"
+
+    if ($SearchResult.Updates.Count -gt 0) {
+        Write-Info "Updates returned by scan:"
+        for ($i = 0; $i -lt $SearchResult.Updates.Count; $i++) {
+            $Update = $SearchResult.Updates.Item($i)
+            Write-Info "  Update $($i + 1): $($Update.Title)"
+        }
+    }
+    else {
+        Write-Info "No applicable software updates were returned by the scan."
+    }
+
+    Start-Sleep -Seconds 10
+
+    $LastWUEventAfterScan = Get-WinEvent `
+        -LogName "Microsoft-Windows-WindowsUpdateClient/Operational" `
+        -MaxEvents 1 `
+        -ErrorAction SilentlyContinue
+
+    if ($LastWUEventAfterScan) {
+        Write-Info "Latest Windows Update event after scan: ID $($LastWUEventAfterScan.Id) at $($LastWUEventAfterScan.TimeCreated)"
+
+        if ($WUEventBeforeTime -and $LastWUEventAfterScan.TimeCreated -gt $WUEventBeforeTime) {
+            Add-Result "Windows Update Event Validation" "PASS" "New Windows Update event detected after scan"
+        }
+        else {
+            Add-Result "Windows Update Event Validation" "WARN" "No newer Windows Update event detected after scan"
+        }
+    }
+    else {
+        Add-Result "Windows Update Event Validation" "WARN" "Unable to read Windows Update event log"
+    }
+}
+catch {
+    Add-Result "Windows Update Scan" "WARN" "COM scan failed: $($_.Exception.Message)"
+    Add-ReadinessReason "Windows Update COM scan returned a warning. Fallback is attempted."
+
+    try {
+        Write-Info "Falling back to UsoClient StartScan"
+        Write-Info "UsoClient StartScan is silent and suitable for Service Desk automation"
+        Write-Info "UsoClient StartInteractiveScan is intentionally not used because it opens Windows Update UI"
+
+        UsoClient StartScan
+        Start-Sleep -Seconds 120
+
+        Add-Result "Windows Update Scan Fallback" "PASS" "UsoClient StartScan triggered and wait completed"
+    }
+    catch {
+        Add-Result "Windows Update Scan Fallback" "FAIL" $_.Exception.Message
+        Add-ReadinessReason "Both COM scan and UsoClient StartScan fallback failed."
+    }
+}
+
+# =====================================================================
+# 9. Telemetry and reporting tasks
+# =====================================================================
+
+Write-Section "STEP 9 - TELEMETRY AND REPORTING TASKS"
+
+try {
+    Write-Info "Discovering common telemetry and reporting scheduled tasks"
+
+    $TelemetryTaskNamePatterns = @(
+        "Consolidator",
+        "Microsoft Compatibility Appraiser",
+        "ProgramDataUpdater",
+        "KernelCeipTask",
+        "UsbCeip"
+    )
+
+    $TelemetryTasks = @()
+
+    foreach ($Pattern in $TelemetryTaskNamePatterns) {
+        $MatchedTask = Get-ScheduledTask -ErrorAction SilentlyContinue |
+            Where-Object { $_.TaskName -eq $Pattern } |
+            Select-Object -First 1
+
+        if ($MatchedTask) {
+            Write-Info "Discovered telemetry/reporting task: $($MatchedTask.TaskPath)$($MatchedTask.TaskName)"
+            $TelemetryTasks += $MatchedTask
+        }
+        else {
+            Add-Result "Telemetry Task Discovery: $Pattern" "WARN" "Task not found on this Windows build"
+        }
+    }
+
+    if ($TelemetryTasks.Count -gt 0) {
+        foreach ($TelemetryTask in $TelemetryTasks) {
+            Start-AndWaitScheduledTask `
+                -TaskName $TelemetryTask.TaskName `
+                -TaskPath $TelemetryTask.TaskPath `
+                -ResultName "Telemetry Task: $($TelemetryTask.TaskName)" `
+                -TimeoutSeconds 300
+        }
+
+        Add-Result "Telemetry Task Stage" "PASS" "Discovered telemetry/reporting tasks processed"
+    }
+    else {
+        Add-Result "Telemetry Task Stage" "WARN" "No telemetry/reporting tasks discovered"
+        Add-ReadinessReason "No common telemetry/reporting scheduled tasks were discovered."
+    }
+}
+catch {
+    Add-Result "Telemetry Task Stage" "WARN" $_.Exception.Message
+    Add-ReadinessReason "Telemetry task stage returned a warning."
+}
+
+# =====================================================================
+# 10. Universal Telemetry Client validation
+# =====================================================================
+
+Write-Section "STEP 10 - UNIVERSAL TELEMETRY CLIENT VALIDATION"
+
+try {
+    Write-Info "Reading Microsoft-Windows-UniversalTelemetryClient/Operational event log"
+
+    $TelemetryEvents = Get-WinEvent `
+        -LogName "Microsoft-Windows-UniversalTelemetryClient/Operational" `
+        -MaxEvents 20 `
+        -ErrorAction Stop
+
+    $LatestTelemetryEvent = $TelemetryEvents | Select-Object -First 1
+
+    if ($LatestTelemetryEvent) {
+        Add-Result "Universal Telemetry Client" "PASS" "Latest event ID $($LatestTelemetryEvent.Id) at $($LatestTelemetryEvent.TimeCreated)"
+    }
+    else {
+        Add-Result "Universal Telemetry Client" "WARN" "No recent telemetry events found"
+        Add-ReadinessReason "No Universal Telemetry Client events were returned."
+    }
+}
+catch {
+    Add-Result "Universal Telemetry Client" "WARN" "Unable to read telemetry log: $($_.Exception.Message)"
+    Add-ReadinessReason "Universal Telemetry Client log could not be read."
+}
+
+# =====================================================================
+# 11. Windows Update event validation
+# =====================================================================
+
+Write-Section "STEP 11 - WINDOWS UPDATE CLIENT EVENT VALIDATION"
+
+try {
+    Write-Info "Reading Microsoft-Windows-WindowsUpdateClient/Operational event log"
+
+    $RecentWUEvents = Get-WinEvent `
+        -LogName "Microsoft-Windows-WindowsUpdateClient/Operational" `
+        -MaxEvents 20 `
+        -ErrorAction Stop
+
+    $LatestWUEvent = $RecentWUEvents | Select-Object -First 1
+
+    if ($LatestWUEvent) {
+        Add-Result "Windows Update Client Events" "PASS" "Latest event ID $($LatestWUEvent.Id) at $($LatestWUEvent.TimeCreated)"
+    }
+    else {
+        Add-Result "Windows Update Client Events" "WARN" "No recent Windows Update events found"
+        Add-ReadinessReason "No recent Windows Update Client events were returned."
+    }
+}
+catch {
+    Add-Result "Windows Update Client Events" "WARN" "Unable to read Windows Update log: $($_.Exception.Message)"
+    Add-ReadinessReason "Windows Update Client event log could not be read."
+}
+
+# =====================================================================
+# 12. Autopatch readiness evaluation
+# =====================================================================
+
+Write-Section "STEP 12 - AUTOPATCH READINESS EVALUATION"
+
+try {
+    $CriticalChecks = @(
+        "Azure AD Joined",
+        "Device Authentication",
+        "MDM Enrollment",
+        "DiagTrack Service",
+        "Windows Update for Business"
+    )
+
+    $CriticalFailures = @()
+
+    foreach ($CriticalCheck in $CriticalChecks) {
+        $CheckResult = $script:Results |
+            Where-Object { $_.Check -eq $CriticalCheck } |
+            Select-Object -First 1
+
+        if (!$CheckResult) {
+            $CriticalFailures += "$CriticalCheck did not return a result"
+        }
+        elseif ($CheckResult.Status -eq "FAIL") {
+            $CriticalFailures += "$CriticalCheck failed: $($CheckResult.Details)"
+        }
+    }
+
+    $WarningResults = @($script:Results | Where-Object { $_.Status -eq "WARN" })
+
+    if ($CriticalFailures.Count -gt 0) {
+        foreach ($Failure in $CriticalFailures) {
+            Add-ReadinessReason $Failure
+        }
+
+        $ReasonText = ($script:ReadinessReasons | Select-Object -Unique) -join " | "
+        Add-Result "Autopatch Readiness" "FAIL" $ReasonText
+    }
+    elseif ($WarningResults.Count -gt 0) {
+        if ($script:ReadinessReasons.Count -eq 0) {
+            Add-ReadinessReason "Critical checks passed, but one or more warnings require review."
+        }
+
+        $ReasonText = ($script:ReadinessReasons | Select-Object -Unique) -join " | "
+        Add-Result "Autopatch Readiness" "WARN" $ReasonText
+    }
+    else {
+        Add-Result "Autopatch Readiness" "PASS" "Critical checks passed. Device is ready for Windows Autopatch reporting."
+    }
+}
+catch {
+    Add-Result "Autopatch Readiness" "WARN" "Readiness evaluation failed: $($_.Exception.Message)"
+}
+
+# =====================================================================
+# 13. Summary and export
+# =====================================================================
+
+Write-Section "STEP 13 - SUMMARY"
+
+$Readiness = $script:Results |
+    Where-Object { $_.Check -eq "Autopatch Readiness" } |
+    Select-Object -Last 1
+
+if ($Readiness) {
+    switch ($Readiness.Status) {
+        "PASS" { Write-Pass "AUTOPATCH READINESS: PASS - $($Readiness.Details)" }
+        "WARN" { Write-WarnLog "AUTOPATCH READINESS: WARN - $($Readiness.Details)" }
+        "FAIL" { Write-Fail "AUTOPATCH READINESS: FAIL - $($Readiness.Details)" }
+        default { Write-Info "AUTOPATCH READINESS: $($Readiness.Status) - $($Readiness.Details)" }
+    }
+}
+
+Write-Host ""
+Write-Host "Detailed result table:" -ForegroundColor Cyan
+$script:Results | Format-Table Time, Check, Status, Details -AutoSize
+
+try {
+    $script:Results | Export-Csv -Path $CsvReportPath -NoTypeInformation -Encoding UTF8
+    Write-Pass "CSV report exported to: $CsvReportPath"
+}
+catch {
+    Write-Fail "Failed to export CSV report: $($_.Exception.Message)"
+}
+
+$RunEndTime = Get-Date
+$Duration = New-TimeSpan -Start $RunStartTime -End $RunEndTime
+
+Write-Section "RUN COMPLETE"
+Write-Info "Run completed at: $RunEndTime"
+Write-Info "Duration: $($Duration.ToString())"
+Write-Info "Transcript log: $TranscriptPath"
+Write-Info "CSV report: $CsvReportPath"
+Write-Info "Recommended post-run action: Refresh the Windows Autopatch report and verify Client State and Client Substate."
+Write-Info "Expected healthy result after backend processing: Client State = Installed, Client Substate = Update successful."
+
+try {
+    Stop-Transcript | Out-Null
+}
+catch {
+    Write-Host "[WARN ] Unable to stop transcript: $($_.Exception.Message)" -ForegroundColor Yellow
+}
